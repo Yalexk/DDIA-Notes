@@ -117,4 +117,58 @@ This whole design (memtable + SSTables on disk + background compaction) is a **L
 
 ## Column-Oriented Storage
 
-> TODO
+- With trillions of rows, storing and querying data efficiently becomes challenging
+- Although fact tables have 100+ columns, a typical analytic query only needs a few of them
+- A row-oriented store has to load every row in full (all columns) from disk, then parse it and filter out the columns it doesn't need
+- **Column-oriented storage** solves this by storing all the values from each column together, e.g. each column in a separate file. A query only reads the columns it uses
+- Each column file stores its rows in the same order, so the kth entry in every column belongs to the kth row
+
+### Column Compression
+
+- Columns are often very repetitive, so they compress well, which reduces disk throughput even further
+- **Bitmap encoding** works well when the number of distinct values in a column is small compared with the number of rows
+  - e.g. a retailer may have billions of sales transactions but only 100,000 distinct products
+  - Each distinct value gets its own bitmap, with one bit per row: 1 if the row has that value, 0 if not
+- If n (the number of distinct values) is large, most bits in each bitmap are 0, giving a **sparse** bitmap. **Run-length encoding** then stores each bitmap compactly as lengths of runs of 0s and 1s
+
+### Memory Bandwidth and Vectorized Processing
+
+- For a query that scans millions of rows, the bottlenecks are:
+  - getting data from disk into memory
+  - getting data from main memory into the CPU cache
+  - using CPU cycles efficiently
+- Column storage reduces the amount of data that has to be loaded
+- **Vectorized processing**: the query engine takes a chunk of compressed column data that fits in the CPU's L1 cache and processes it in a tight loop, with no function call per row
+- Some operators, such as bitwise AND/OR on bitmaps, work directly on the compressed data without decompressing it first
+
+### Sort Order in Column Storage
+
+- By default, row order doesn't matter: rows can simply be stored in insertion order
+- If we do sort, we must sort whole rows, not each column independently, otherwise the kth entries would no longer belong to the same row
+- The database administrator chooses the sort columns based on common queries, e.g. sort by date first, then by product
+- Sorting helps compression: the first sort column ends up with long runs of the same value, which run-length encoding shrinks to almost nothing. The effect is weaker for the second and third sort keys, whose values are more jumbled
+- Different queries benefit from different sort orders, so the same data can be stored sorted in several different ways (introduced by **C-Store**, adopted by Vertica)
+  - The data needs replicating across machines for fault tolerance anyway, so each replica can use a different sort order
+
+### Writing to Column-Oriented Storage
+
+- Column storage, sorting and compression make large reads fast, but writes become harder
+- Compressed columns can't be updated in place the way B-tree pages can
+- Rows are identified by their position, so inserting a row into the middle of a sorted table would mean rewriting every column file
+- Solution: **LSM-trees**
+  - Writes go to a sorted in-memory store first
+  - Once enough rows have accumulated, they are merged with the column files on disk and written out to new files in bulk (Vertica does this)
+  - Queries must combine data from memory and disk, but the query engine hides this from the user
+
+### Aggregation: Data Cubes and Materialized Views
+
+- Not all data warehouses use column stores, but they are becoming popular because they make analytic queries much faster
+- Warehouse queries often use aggregate functions such as `SUM`, `AVG` and `COUNT`, so it can help to cache frequently used aggregates
+- A **materialized view** is one such cache: an actual copy of the query results, written to disk
+  - A virtual view, by contrast, is just a shortcut for writing a query
+  - A materialized view must be updated whenever the underlying data changes
+  - This makes writes more expensive, which is why materialized views are rarely used in OLTP databases but make sense in read-heavy data warehouses
+- A **data cube** (OLAP cube) is a special kind of materialized view: a grid of aggregates grouped by different dimensions
+  - Certain queries become very fast, because the answer has already been computed
+  - Downside: they are inflexible. You can only query by the dimensions the cube was built on. If price isn't a dimension, you can't ask for "sales where price > 100"
+  - So most warehouses keep the raw data and use cubes only to speed up common queries
