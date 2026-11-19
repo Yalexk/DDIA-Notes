@@ -118,3 +118,103 @@
   - Examples: Databus for Oracle, Bucardo for PostgreSQL
 - **Disadvantage**: greater overheads than other replication methods, and more prone to bugs and limitations than the database's built-in replication
 - Despite this, its **flexibility** makes it useful
+
+## Problems with Replication Lag
+
+- Leader-based replication suits workloads that are **mostly reads** with only a small percentage of writes (common on the web). Read requests can be spread across followers, so you can scale up read capacity by adding followers. This is a **read-scaling architecture**
+- This only works realistically with **asynchronous** replication. With synchronous replication, a single node failing (or a network fault) would block writes for the whole system
+- The downside of asynchronous followers: a follower that has fallen behind may return **different results** from the leader (or from other followers), since not all writes have been applied yet
+- This inconsistency is only temporary: if you stop writing to the leader and wait, followers will eventually catch up and become consistent with the leader. This is called **eventual consistency**
+  - "Eventually" is deliberately vague: there is no limit on how far behind a replica can fall
+- The delay between a write happening on the leader and being reflected on a follower is called **replication lag**
+  - Normally this is a fraction of a second, but it can grow to seconds or even minutes if the system is operating near capacity or there is a network problem
+  - When lag is large, the inconsistencies become a real problem for applications
+
+### Reading Your Own Writes
+
+- Users often submit data (e.g. a comment) and then view what they submitted. Writes go to the **leader**, but the read may be served by a **follower**
+- With asynchronous replication, the new data may not have reached that follower yet, so to the user it looks like the data was **lost**
+- **Read-after-write consistency** (or **read-your-writes consistency**) guarantees that a user will always see any updates they submitted themselves
+  - It makes **no promises about other users**: their updates may not be visible yet
+- Techniques for implementing it:
+  - When reading something the user **may have modified**, read it from the leader, otherwise read from a follower (e.g. a user's own profile is always read from the leader, other users' profiles from a follower). This requires knowing what might have been modified without querying
+  - If most things in the application are potentially editable by the user, this is not effective. Instead, track the **time of the last update**: for one minute after the last update, make all reads from the leader. You can also prevent queries on followers that are more than a minute behind
+  - The client remembers the **timestamp of its most recent write**. The system ensures the replica serving reads reflects updates at least up to that timestamp. If it doesn't, the read can be handled by **another replica**, or **wait** until the replica has caught up
+    - The timestamp could be a **logical timestamp** (e.g. a log sequence number) or the system clock (which requires clock synchronisation)
+- Extra complexity arises when the same user accesses the service from **multiple devices**: **cross-device read-after-write consistency**
+  - Approaches that remember the timestamp of the user's last update become harder, since one device doesn't know what updates happened on the other. This metadata needs to be **centralised**
+  - If replicas are in different datacenters, there is no guarantee that connections from different devices (e.g. cellular vs. home broadband) are routed to the same datacenter. If an approach requires reading from the leader, requests from **all of the user's devices** must be routed to the datacenter containing the leader
+
+### Monotonic Reads
+
+- Another anomaly with asynchronous followers: a user can see things **moving backward in time**
+- This can happen if a user makes several reads from **different replicas**. E.g. a user refreshes a page and the request goes to a random replica. The first replica has a recent comment, but the second replica has more lag, so the comment **disappears** on refresh
+- **Monotonic reads** guarantee this doesn't happen: if a user makes several reads in sequence, they will not read older data after having previously read newer data
+  - It is a weaker guarantee than strong consistency, but stronger than eventual consistency
+- One way to achieve it is to make sure each user always reads from the **same replica** (different users can read from different replicas)
+  - The replica can be chosen based on a **hash of the user ID**, rather than randomly
+  - If that replica fails, the user's queries need to be rerouted to another replica
+
+### Consistent Prefix Reads
+
+- A third anomaly concerns **causality**, where writes happen in a certain order but are observed in a different one (e.g. an observer sees an answer to a question before the question itself)
+- **Consistent prefix reads** guarantee that if a sequence of writes happens in a certain order, anyone reading those writes will see them appear in the **same order**
+- This is a particular problem in **partitioned (sharded) databases**:
+  - Within a single partition, replication applies writes in the same order, so the problem doesn't occur
+  - Different partitions operate **independently**, so there is **no global ordering of writes**. A reader may see some parts of the database in an older state and others in a newer state
+- One solution is to make sure any writes that are **causally related** to each other are written to the **same partition**. In some applications this cannot be done efficiently
+  - There are also algorithms that explicitly keep track of causal dependencies (see later in this chapter)
+
+### Solutions for Replication Lag
+
+- When working with an eventually consistent system, think about how the application behaves if replication lag increases to **several minutes or even hours**
+- If this results in a bad experience for users, it's important to design the system to provide a **stronger guarantee**, such as read-after-write
+- Pretending replication is synchronous when it is actually asynchronous is a source of problems
+- Applications can provide stronger guarantees than the underlying database (e.g. performing certain reads on the leader), but handling this in application code is **complex** and easy to get wrong
+- It would be better if application developers didn't have to worry about these subtle replication issues. This is why **transactions** exist: they are a way for a database to provide stronger guarantees so that the application can be simpler (see Chapter 7)
+
+## Multi-Leader Replication
+
+- Leader-based replication has one major downside: there is only **one leader**, and all writes must go through it. If you can't connect to the leader (e.g. a network interruption), you can't write to the database
+- **Multi-leader replication** (also known as **master–master** or **active/active**) is a natural extension: allow **more than one node** to accept writes
+  - Each node that processes a write forwards the data change to all the other nodes
+  - Each leader simultaneously acts as a **follower** to the other leaders
+
+### Multi-Datacenter Operation
+
+- It rarely makes sense to use a multi-leader setup within a **single datacenter**, because the benefits rarely outweigh the added complexity. There are some situations where it is reasonable, the first being multiple datacenters
+- With a normal leader-based setup across multiple datacenters, the leader must be in **one** of the datacenters, and all writes go through it
+- In a multi-leader configuration, you can have a **leader in each datacenter**. Within each datacenter, regular leader–follower replication is used. Between datacenters, each datacenter's leader replicates its changes to the leaders in other datacenters
+- Comparing single-leader and multi-leader in a multi-datacenter deployment:
+  - **Performance**:
+    - Single-leader: every write must go over the internet to the datacenter with the leader, adding significant latency
+    - Multi-leader: every write is processed in the **local datacenter** and replicated **asynchronously** to the others. The inter-datacenter network delay is hidden from users, so perceived performance is better
+  - **Tolerance of datacenter outages**:
+    - Single-leader: if the datacenter with the leader fails, failover can promote a follower in another datacenter
+    - Multi-leader: each datacenter can continue operating **independently** of the others, and replication catches up when the failed datacenter comes back online
+  - **Tolerance of network problems**:
+    - Traffic between datacenters usually goes over the public internet, which is typically less reliable than the local network within a datacenter
+    - A single-leader configuration is very sensitive to problems on this link, as writes are made synchronously over it. A multi-leader configuration with asynchronous replication can usually tolerate network problems better: a temporary interruption doesn't prevent writes from being processed
+- **Downside**: the same data may be **concurrently modified in two different datacenters**, and those write conflicts must be resolved
+- Multi-leader replication is often implemented with external tools (e.g. Tungsten Replicator for MySQL, BDR for PostgreSQL, GoldenGate for Oracle) and has subtle configuration pitfalls and surprising interactions with other database features:
+  - **Autoincrementing keys**, **triggers** and **integrity constraints** can be problematic
+  - For this reason, multi-leader replication is often considered **dangerous territory** that should be avoided if possible
+
+### Clients with Offline Operation
+
+- Another situation for multi-leader replication is an application that needs to keep working while **disconnected from the internet**
+- E.g. a calendar app: you need to be able to view and make meetings at any time, even offline. Changes made offline are synced with a server and your other devices when the device is next online
+- Every device has a local database that acts as a **leader** (it accepts writes), and there is an asynchronous multi-leader replication process (sync) between the replicas of the calendar on all devices
+- This is essentially multi-leader replication **taken to the extreme**: each device is a "datacenter", and the network connection between them is extremely unreliable
+  - Replication lag may be **hours or even days**, depending on when the device next has internet access
+- Tools such as CouchDB are designed for this mode of operation
+
+### Collaborative Editing
+
+- **Real-time collaborative editing** applications (e.g. Google Docs, Etherpad) allow several people to edit a document **simultaneously**
+- This is not usually thought of as a database replication problem, but has a lot in common with offline editing
+- When a user edits a document, the changes are applied to their **local replica** (in their browser or client app) instantly, and **asynchronously replicated** to the server and any other users editing the same document
+- To guarantee there are **no editing conflicts**, the application must obtain a **lock** on the document before a user can edit it
+  - If another user wants to edit the same document, they must wait until the first user has committed their changes and released the lock
+  - This is equivalent to **single-leader replication with transactions on the leader**
+- For **faster collaboration**, the unit of change should be very small (e.g. a single keystroke) to avoid locking. This allows multiple users to edit simultaneously, but brings all the challenges of **multi-leader replication**, including **conflict resolution**
