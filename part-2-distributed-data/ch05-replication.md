@@ -218,3 +218,56 @@
   - If another user wants to edit the same document, they must wait until the first user has committed their changes and released the lock
   - This is equivalent to **single-leader replication with transactions on the leader**
 - For **faster collaboration**, the unit of change should be very small (e.g. a single keystroke) to avoid locking. This allows multiple users to edit simultaneously, but brings all the challenges of **multi-leader replication**, including **conflict resolution**
+
+### Handling Write Conflicts
+
+- The main issue with multi-leader replication is that **write conflicts** can occur, e.g. when two users simultaneously modify the same record, and the writes are sent to two different leaders
+
+#### Synchronous vs. Asynchronous Conflict Detection
+
+- With multi-leader replication, both writes succeed locally, so the conflict is only detected **asynchronously at a later point in time**
+- The system could be made synchronous to avoid conflicts (waiting for a write to be replicated to all replicas before telling the user it succeeded), but that **defeats the main advantage** of multi-leader replication (each replica accepting writes independently)
+
+#### Conflict Avoidance
+
+- The simplest strategy is to **avoid conflicts**: ensure all writes for a particular record go through the **same leader**
+- This breaks down if you want to **change the designated leader** for a record, e.g. because that datacenter has failed or the user has moved. Concurrent writes on different leaders are possible again
+
+#### Converging Toward a Consistent State
+
+- A single-leader database applies writes in a **defined order**; multi-leader configurations have **no defined ordering** of writes
+- The database must resolve conflicts **convergently**: all replicas must arrive at the **same final value** once all changes have been replicated
+- Ways of achieving convergent conflict resolution:
+  - Give each write a **unique ID** (e.g. timestamp, random number, UUID), pick the write with the highest ID as the winner and discard the others (**last write wins**, LWW). **Prone to data loss**
+  - Give each **replica** a unique ID, and let writes originating from a higher-numbered replica take precedence. Also **prone to data loss**
+  - Somehow **merge** the values together (e.g. order alphabetically and concatenate)
+  - **Record** the conflict in an explicit data structure that preserves all information, and write application code that resolves it later (perhaps by prompting the user)
+
+#### Custom Conflict Resolution Logic
+
+- The most appropriate resolution strategy depends on the application, so many multi-leader systems let you write **conflict resolution code**, executed either on write or on read
+- **On write**: as soon as the database detects a conflict in the log of replicated changes, it calls a **conflict handler**
+  - Typically runs in a background process and must execute quickly, so it can't prompt a user
+- **On read**: when a conflict is detected, **all conflicting writes are stored**. The next time the data is read, the multiple versions are returned to the application, which may resolve the conflict automatically or prompt the user, and then writes the result back
+
+### Multi-Leader Replication Topologies
+
+- A **replication topology** describes the communication paths along which writes are propagated from one node to another
+- With more than two leaders, there are several possible paths a write could take
+- **All-to-all**: every leader sends its writes to every other leader. The most general topology
+- **Circular**: each node receives writes from **one** node and forwards them (plus its own) to **one** other node
+- **Star**: one designated root node forwards writes to all of the other nodes. Can be generalised to a tree
+- In circular and star topologies a write may pass through several nodes before reaching all replicas, so nodes must forward data from other nodes
+  - To prevent infinite replication loops, each write is tagged with the identifiers of the nodes it has passed through, and a node ignores writes already tagged with its own identifier
+- **Fault tolerance**:
+  - In circular and star topologies, if one node fails it can **interrupt the flow of replication messages** between other nodes, until the topology is reconfigured
+  - All-to-all topologies are generally more fault tolerant because messages can travel along **multiple paths**, avoiding a single point of failure
+- All-to-all topologies have their own issues: some network links may be **faster than others**, so some replication messages can **overtake** others
+  - This causes **causality** problems: e.g. an update to a row may arrive at a replica before the insert that created it
+  - Simply attaching timestamps to writes is not enough, as clocks cannot be trusted to be synchronised. **Version vectors** can be used to order events correctly (covered later)
+
+## Leaderless Replication
+
+- Some storage systems abandon the concept of a leader and allow **any replica to directly accept writes** from clients
+- In some leaderless implementations, the client **sends its writes directly to several replicas**. In others, a **coordinator node** does this on behalf of the client
+  - Unlike a leader, the coordinator does **not enforce a particular ordering** of writes
