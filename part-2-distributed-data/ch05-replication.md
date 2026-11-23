@@ -271,3 +271,46 @@
 - Some storage systems abandon the concept of a leader and allow **any replica to directly accept writes** from clients
 - In some leaderless implementations, the client **sends its writes directly to several replicas**. In others, a **coordinator node** does this on behalf of the client
   - Unlike a leader, the coordinator does **not enforce a particular ordering** of writes
+- This approach was used in Amazon's in-house **Dynamo** system, so leaderless stores modelled on it (Riak, Cassandra, Voldemort) are often called **Dynamo-style**. Some memcached-style caches also use it
+
+### Writing to the Database When a Node Is Down
+
+- Consider a cluster of three replicas where one replica is unavailable (down for a reboot, a crash, a network fault, etc.)
+- In a **leader-based** configuration, if the unavailable node is the **leader**, writes cannot continue until a **failover** has promoted one of the followers. An unavailable *follower* doesn't require a failover, as the leader still accepts writes
+- In a **leaderless** configuration, **failover does not exist**:
+  - The client sends the write to **all replicas in parallel**, and the write is considered successful once a sufficient number of replicas acknowledge it. The missing acknowledgement from the unavailable node is simply **ignored**
+  - When that node comes back online and clients start reading from it, it returns **stale** values for any writes it missed
+  - To handle this, the client doesn't read from just one replica: reads are also sent to **several replicas in parallel**, and the client may get different responses back
+  - Every value is tagged with a **version number**, which lets the client work out which value is newer and which responses are stale
+
+### Read Repair and Anti-Entropy
+
+- After an unavailable node comes back online, how does it catch up on the writes it missed? Two mechanisms are often used together:
+- **Read repair**: when a client reads from several nodes in parallel, it can detect any **stale responses** and write the newer value back to the stale replica
+  - Works well for values that are **frequently read**
+  - A value that is rarely read may stay stale for a long time, which **reduces durability**: it may be missing from all but one or two replicas
+- **Anti-entropy process**: a **background process** in the datastore that constantly looks for differences in the data between replicas and copies any missing data from one replica to another
+  - Unlike the leader's replication log, it does **not** copy writes in any particular order, and there may be a **significant delay** before data is copied
+
+### Quorums for Reading and Writing
+
+- How many replicas must acknowledge a write for it to be considered successful, and how many must we query for a read?
+- If there are **n** replicas, every write must be confirmed by at least **w** nodes, and we must query at least **r** nodes for every read. As long as **w + r > n**, we expect to get an up-to-date value when reading, because at least one of the nodes we read from must have seen the latest successful write (the read and write sets **overlap**). Reads and writes that obey these rules are called **quorum** reads and writes
+- A common choice is to make n an **odd** number (typically 3 or 5) and set w = r = (n + 1) / 2, rounded up
+- n is usually not the number of nodes in the whole cluster: the dataset is **partitioned** across nodes, and n is the number of replicas **of the value being read or written**. In Dynamo-style databases, n, w and r are **configurable**
+- Writes and reads are usually sent to **all n replicas in parallel**; w and r determine how many responses we **wait for** before declaring success
+- The quorum condition also sets the failure tolerance:
+  - If fewer than w or r nodes are available, writes or reads return an **error**
+  - With n = 3, w = 2, r = 2 we can tolerate **one** unavailable node; with n = 5, w = 3, r = 3 we can tolerate **two**
+- Setting w and r to smaller numbers (so that w + r ≤ n) means reads are **more likely to return stale values**, but it gives **lower latency** and **higher availability**: the system can still serve reads and writes when more nodes are down
+
+### Limitations of Quorum Consistency
+
+- With w + r > n you generally expect every read to return the most recently written value, but there are **edge cases** where this doesn't hold:
+  - With a **sloppy quorum** (discussed later), the w writes may end up on **different nodes** than the r reads, so there is no longer a guaranteed overlap
+  - If two writes occur **concurrently**, it is not clear which one happened first. The only safe solution is to **merge** the concurrent writes; if a winner is picked based on a timestamp (**last write wins**), writes can be **lost** due to clock skew
+  - If a write happens **concurrently with a read**, the write may be reflected on only **some** of the replicas. It is then undetermined whether the read returns the old or the new value
+  - If a write succeeded on fewer than w replicas and was reported as failed, it is **not rolled back** on the replicas where it did succeed. Subsequent reads **may or may not** return the value from that write
+  - If a node carrying a new value fails and is restored from a replica carrying an older value, the number of replicas storing the new value may **fall below w**, breaking the quorum condition
+  - Even when everything is working correctly, there are edge cases where **unlucky timing** leads to stale reads
+- Quorums therefore appear to guarantee that a read returns the latest written value, but in practice it is **not that simple**. Dynamo-style databases are generally optimised for eventually consistent use cases; stronger guarantees (such as reading your own writes, monotonic reads and consistent prefix reads) generally require **transactions** or **consensus**
