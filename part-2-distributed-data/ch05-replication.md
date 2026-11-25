@@ -314,3 +314,77 @@
   - If a node carrying a new value fails and is restored from a replica carrying an older value, the number of replicas storing the new value may **fall below w**, breaking the quorum condition
   - Even when everything is working correctly, there are edge cases where **unlucky timing** leads to stale reads
 - Quorums therefore appear to guarantee that a read returns the latest written value, but in practice it is **not that simple**. Dynamo-style databases are generally optimised for eventually consistent use cases; stronger guarantees (such as reading your own writes, monotonic reads and consistent prefix reads) generally require **transactions** or **consensus**
+
+#### Monitoring Staleness
+
+- Even if an application can tolerate stale reads, it's important to **monitor** the health of replication, so that if it falls behind significantly the cause can be investigated
+- In leader-based replication this is fairly easy: replication lag can be measured by comparing positions in the replication log
+- In leaderless replication there is **no fixed order** in which writes are applied, which makes monitoring much more difficult
+
+### Sloppy Quorums and Hinted Handoff
+
+- Databases with appropriately configured quorums can tolerate individual nodes being **down or slow**, which makes them appealing for use cases that require **high availability and low latency** and can tolerate occasional stale reads
+- However, quorums are not as fault tolerant as they could be: a **network interruption** can cut a client off from a large number of nodes, leaving fewer than w or r of the value's home nodes reachable
+- When a quorum of w or r nodes can't be reached, database designers face a trade-off:
+  - Return an **error** for all requests that can't reach a quorum
+  - Or **accept writes anyway**, and write them to some nodes that are reachable but **aren't among the n nodes** on which the value usually lives
+- The second option is a **sloppy quorum**: writes and reads still require w and r successful responses, but those may include nodes that are not among the value's designated n "home" nodes
+- Once the network interruption is fixed, the **temporary nodes** send any writes they accepted on behalf of another node to the appropriate home nodes. This is called **hinted handoff**
+- Sloppy quorums **increase write availability**, but a read of r nodes is no longer guaranteed to see the latest value, as it may have been written to nodes outside the n
+  - A sloppy quorum is really only an assurance of **durability** (the data is stored on w nodes *somewhere*), not a true quorum
+
+#### Multi-Datacenter Operation
+
+- Leaderless replication is also suitable for **multi-datacenter** operation, since it is designed to tolerate conflicting concurrent writes, network interruptions and latency spikes
+- **Cassandra**: n includes nodes in **all** datacenters. Each write is sent to all replicas regardless of datacenter, but the client usually only waits for acknowledgement from a quorum of nodes within its **local** datacenter, so it is unaffected by delays on cross-datacenter links
+- **Riak**: keeps all client communication local to one datacenter, so n describes the replicas **within one datacenter**. Cross-datacenter replication happens **asynchronously** in the background, similar to multi-leader replication
+
+### Detecting Concurrent Writes
+
+- Dynamo-style databases allow several clients to **concurrently write** to the same key, so conflicts can occur even with strict quorums
+- Events may **arrive in a different order** at different nodes, due to variable network delays and partial failures
+- If each node simply overwrote the value whenever it received a write, the nodes would become **permanently inconsistent**
+- To become **eventually consistent**, replicas should **converge** toward the same value
+
+#### Last Write Wins (Discarding Concurrent Writes)
+
+- One approach is for each replica to store only the **"most recent"** value, allowing older values to be overwritten and discarded
+- But when writes are concurrent their order is undefined, so "most recent" is **arbitrary**. We can force an order, e.g. by attaching a **timestamp** to each write and picking the **biggest** timestamp as the most recent. This is **last write wins (LWW)**
+- LWW achieves eventual convergence, but at the cost of **durability**:
+  - If there are several concurrent writes to the same key, they are all reported as **successful** to the client, but only one survives and the others are **silently discarded**
+  - Because of clock skew, LWW may even drop writes that were **not** concurrent
+- LWW is a poor choice if **losing data** is not acceptable
+- The only safe way to use LWW is to ensure a key is **written only once** and thereafter treated as immutable, avoiding concurrent updates to it. E.g. use a **UUID** as the key, giving every write operation a unique key
+
+#### The "Happens-Before" Relationship and Concurrency
+
+- An operation A **happens before** B if B knows about A, depends on A, or builds upon A in some way
+- Two operations are **concurrent** if neither happens before the other (i.e. neither **knows about** the other)
+- Given two operations A and B, there are three possibilities: A happened before B, B happened before A, or A and B are concurrent
+- Concurrency is **not about physical time overlapping**: two operations can be concurrent even if they happened far apart in time, as long as neither was aware of the other
+
+#### Capturing the Happens-Before Relationship
+
+- A server can determine whether two operations are concurrent by looking at **version numbers**:
+  - The server maintains a version number for **every key**, incrementing it every time that key is written, and stores the new version number along with the value written
+  - When a client **reads** a key, the server returns **all values that have not been overwritten**, as well as the **latest version number**. A client must read a key before writing
+  - When a client **writes** a key, it must include the **version number from the prior read**, and it must **merge** together all values it received in that read
+  - When the server receives a write with a particular version number, it can **overwrite** all values with that version number **or below** (since they have been merged into the new value), but it must **keep** all values with a **higher** version number (because those are concurrent with the incoming write)
+- A write that includes **no version number** is concurrent with all other writes, so it won't overwrite anything; it is returned as one of the values on subsequent reads
+
+#### Merging Concurrently Written Values
+
+- This algorithm ensures no data is silently dropped, but the client has to do extra work: if several operations happen concurrently, clients must **clean up** afterwards by merging the concurrently written values. Riak calls these concurrent values **siblings**
+- A simple approach is to take the **union** of the siblings (e.g. for a shopping cart). But this doesn't work for **removals**: an item removed in one sibling would reappear in the union
+- To handle removals, the system leaves a marker with an appropriate version number to indicate the item was removed, called a **tombstone**
+- Merging siblings in application code is **complex and error prone**, so there are data structures designed to merge automatically, such as **CRDTs** (conflict-free replicated datatypes), which Riak supports
+
+#### Version Vectors
+
+- The example above used a **single replica**. How does the algorithm change with **multiple replicas** and no leader?
+- With multiple replicas accepting writes concurrently, we need a version number **per replica** as well as per key
+- Each replica increments **its own** version number when processing a write, and also keeps track of the version numbers it has seen from **each of the other** replicas. This tells it which values to overwrite and which to keep as siblings
+- The collection of version numbers from all the replicas is called a **version vector**. Riak uses a variant called a **dotted version vector**
+- As before, version vectors are sent from the database to clients when values are **read**, and need to be sent back to the database when a value is subsequently **written**. Riak encodes the version vector as a string it calls the **causal context**
+- The version vector lets the database **distinguish between overwrites and concurrent writes**, and makes it safe to read from one replica and subsequently write back to another
+- Version vectors are sometimes called **vector clocks**, but the two are subtly different: version vectors are the right structure for comparing the state of replicas
